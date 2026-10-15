@@ -76,10 +76,12 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 
 
+
 def search_web(query):
-    """Tavily를 이용해 인터넷 검색 결과를 가져온다."""
+    """Tavily 검색 결과와 실패 원인을 로그에 기록한다."""
 
     if not TAVILY_API_KEY:
+        logger.error("Tavily 검색 중단: TAVILY_API_KEY가 설정되지 않음")
         return "인터넷 검색 기능이 설정되지 않았어요."
 
     try:
@@ -99,16 +101,20 @@ def search_web(query):
             timeout=15,
         )
 
+        logger.info("Tavily 응답 상태: HTTP %s", response.status_code)
         response.raise_for_status()
-        data = response.json()
 
+        data = response.json()
         results = []
 
         answer = data.get("answer")
         if answer:
             results.append(f"검색 요약: {answer}")
 
-        for item in data.get("results", []):
+        items = data.get("results", [])
+        logger.info("Tavily 검색 결과 개수: %s", len(items))
+
+        for item in items:
             title = item.get("title", "")
             content = item.get("content", "")
             url = item.get("url", "")
@@ -121,13 +127,24 @@ def search_web(query):
                 )
 
         if not results:
+            logger.warning("Tavily가 요약과 검색 결과를 모두 반환하지 않음")
             return "검색 결과를 찾지 못했어요."
 
+        logger.info("Tavily 검색 성공: 전달할 자료 수=%s", len(results))
         return "\n\n".join(results)
 
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        logger.exception("Tavily HTTP 오류: status=%s", status)
+        return f"인터넷 검색 API에서 HTTP {status} 오류가 발생했어요."
+
     except requests.RequestException:
-        logger.exception("인터넷 검색 실패")
-        return "인터넷 검색 중 오류가 발생했어요. 잠시 후 다시 시도해 주세요."
+        logger.exception("Tavily 네트워크 요청 실패")
+        return "인터넷 검색 중 연결 오류가 발생했어요."
+
+    except (ValueError, TypeError):
+        logger.exception("Tavily 응답 JSON 처리 실패")
+        return "인터넷 검색 응답을 처리하지 못했어요."
 
 def needs_web_search(question):
     """인터넷 검색이 필요한 질문인지 판단한다."""
