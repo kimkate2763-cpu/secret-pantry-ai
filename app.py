@@ -18,12 +18,13 @@ SYSTEM_PROMPT = """
 항상 자연스럽고 편안한 한국어로 대화해.
 친절하고 재치 있게 답변하되 지나치게 길게 말하지 마.
 모르는 내용은 아는 척하지 말고 솔직하게 말해.
-사용자가 고민을 이야기하면 공감하며 현실적인 조언을 해줘.
+사용자가 고민을 이야기하면 공감하면서 현실적인 조언을 해줘.
 """
 
+# 사용 가능한 모델 목록에 있는 Gemini 3.6 Flash 사용
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/"
-    "models/gemini-3.8-flash:generateContent"
+    "models/gemini-3.6-flash:generateContent"
 )
 
 RETRY_STATUS_CODES = (408, 429, 500, 502, 503, 504)
@@ -35,7 +36,6 @@ def home():
 
 
 def get_available_models():
-    """현재 API 키로 조회 가능한 모델 중 텍스트 생성 지원 모델을 반환한다."""
     response = requests.get(
         "https://generativelanguage.googleapis.com/v1beta/models",
         headers={"x-goog-api-key": GEMINI_API_KEY},
@@ -58,10 +58,7 @@ def get_available_models():
 
 
 def ask_gemini(question):
-    """일시적인 서버 오류에 최대 3번까지 재시도한다."""
     for attempt in range(3):
-        response = None
-
         try:
             response = requests.post(
                 GEMINI_URL,
@@ -95,7 +92,15 @@ def ask_gemini(question):
                     time.sleep(wait_seconds)
                     continue
 
+            if not response.ok:
+                app.logger.error(
+                    "Gemini API HTTP %s: %s",
+                    response.status_code,
+                    response.text[:1500],
+                )
+
             response.raise_for_status()
+
             data = response.json()
             candidates = data.get("candidates", [])
 
@@ -116,7 +121,9 @@ def ask_gemini(question):
             return answer or "이번에는 답변을 만들지 못했어. 다시 물어봐 줘!"
 
         except (requests.Timeout, requests.ConnectionError):
-            app.logger.exception("Gemini 연결 오류 (%s/3)", attempt + 1)
+            app.logger.exception(
+                "Gemini 연결 오류 (%s/3)", attempt + 1
+            )
 
             if attempt < 2:
                 time.sleep(2 ** (attempt + 1))
@@ -172,10 +179,7 @@ def callback():
 
             except Exception:
                 app.logger.exception("Gemini 모델 목록 조회 실패")
-                answer = (
-                    "모델 목록 조회에 실패했어. "
-                    "Render 로그에서 오류를 확인해 줘."
-                )
+                answer = "모델 목록 조회에 실패했어. Render 로그를 확인해 줘."
 
         elif text.lower().startswith("!ai"):
             question = text[3:].strip()
