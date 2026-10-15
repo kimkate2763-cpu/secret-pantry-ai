@@ -63,8 +63,9 @@ def callback():
             answer = "무엇이 궁금해? !AI 뒤에 질문을 적어 줘!"
         else:
             try:
-                response = requests.post(
-                    https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent
+                
+                  response = requests.post(
+                    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
                     headers={
                         "x-goog-api-key": GEMINI_API_KEY,
                         "Content-Type": "application/json"
@@ -82,6 +83,7 @@ def callback():
                     },
                     timeout=25
                 )
+
                 response.raise_for_status()
                 data = response.json()
                 answer = data["candidates"][0]["content"]["parts"][0]["text"]
