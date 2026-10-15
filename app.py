@@ -6,6 +6,9 @@ import logging
 import time
 import random
 
+from collections import defaultdict
+from threading import Lock
+
 import requests
 from flask import Flask, request, abort, jsonify
 
@@ -13,6 +16,58 @@ app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("secret-pantry-ai")
+
+MAX_HISTORY_TURNS = 10
+
+conversation_histories = defaultdict(list)
+
+history_lock = Lock()
+
+def get_conversation_key(event):
+
+    """같은 사람의 대화는 이어가되, 다른 사람과 기록이 섞이지 않게 한다."""
+
+    source = event.get("source", {})
+
+    user_id = source.get("userId")
+
+    if not user_id:
+
+        return None
+
+    group_id = source.get("groupId") or source.get("roomId") or "direct"
+
+    return f"{group_id}:{user_id}"
+
+def get_history(key):
+
+    """저장된 대화 기록을 복사해서 반환한다."""
+
+    if not key:
+
+        return []
+
+    with history_lock:
+
+        return list(conversation_histories[key])
+
+def save_history(key, question, answer):
+
+    """질문과 답변을 함께 저장하고 오래된 기록은 정리한다."""
+
+    if not key:
+
+        return
+
+    with history_lock:
+
+        history = conversation_histories[key]
+
+        history.append({"role": "user", "parts": [{"text": question}]})
+
+        history.append({"role": "model", "parts": [{"text": answer}]})
+
+        del history[:-MAX_HISTORY_TURNS * 2]
 
 # 환경변수: Render 대시보드에서 설정
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
@@ -450,19 +505,21 @@ def extract_gemini_text(data):
     return "".join(text_parts).strip(), finish_reason
 
 
-def ask_gemini(question):
-    """모델별로 일시 오류를 한 번 재시도하고, 실패하면 다음 모델로 넘어감."""
+
+def ask_gemini(question, history=None):
     if not GEMINI_API_KEY:
         return "Gemini API 키가 설정되지 않았어. 관리자에게 알려 줘."
 
-    contents = [
-        {
-            "role": "user",
-            "parts": [{"text": question}],
-        }
-    ]
+    # 이전 대화 기록에 현재 질문을 추가해 전송
+    contents = list(history or [])
+    contents.append({
+        "role": "user",
+        "parts": [{"text": question}],
+    })
 
+    """모델별로 일시 오류를 한 번 재시도하고, 실패하면 다음 모델로 넘어감."""
     last_error = "알 수 없는 오류"
+
 
     for model in GEMINI_MODELS:
         logger.info("Gemini 모델 시도: %s", model)
@@ -690,7 +747,14 @@ def callback():
             continue
 
         logger.info("AI 질문 수신: chars=%s", len(question))
-        answer = ask_gemini(question)
+
+        conversation_key = get_conversation_key(event)
+        history = get_history(conversation_key)
+
+        answer = ask_gemini(question, history)
+
+        if answer and not answer.startswith("지금은 AI 답변을 가져오지 못했어."):
+            save_history(conversation_key, question, answer)
 
         if reply_token:
             reply_to_line(reply_token, answer)
