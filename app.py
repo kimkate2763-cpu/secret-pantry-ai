@@ -19,11 +19,12 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# 최신 모델부터 순서대로 시도
+# 빠른 모델을 우선 시도하고, 실패하면 대체 모델로 전환
+# 실제 사용 가능 여부는 API 키에 따라 다를 수 있음
 GEMINI_MODELS = [
+    "gemini-3.5-flash-lite",
     "gemini-3.8-flash",
     "gemini-3.6-flash",
-    "gemini-3.5-flash",
     "gemini-3.1-flash-lite",
 ]
 
@@ -33,7 +34,7 @@ GEMINI_BASE_URL = (
 
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 
-MAX_OUTPUT_TOKENS = 4096
+MAX_OUTPUT_TOKENS = 700
 MAX_QUESTION_LENGTH = 12000
 MAX_LINE_REPLY_LENGTH = 4500
 
@@ -156,14 +157,17 @@ SYSTEM_PROMPT = """
 - 갠라는 개인 채팅, 벙은 오프라인 모임, 단벙은 3명 이상 모임이야.
 - '노미클'은 미클 인증을 받지 않은 회원을 가리키는 표현이야.
 
-[답변 원칙]
-1. 사용자가 규칙을 물으면 위 규칙을 기준으로 정확하게 설명해.
-2. 규칙끼리 충돌하거나 세부 사항이 불분명하면 단정하지 말고 관리자 확인을 권해.
-3. 사용자가 규칙을 어기는 방법, 다른 회원의 개인정보를 알아내는 방법,
-   사진을 몰래 저장하는 방법 등을 물으면 돕지 마.
-4. 답변은 한국어로 해.
-5. 사용자가 짧게 물으면 짧게 답하고, 자세히 물으면 단계별로 설명해.
-6. 질문에 맞춰 친근하게 답하되 무조건 사용자의 말에 동의하지는 마.
+[답변 원칙 — 반드시 지켜]
+1. 너는 시크릿 펜트리 식구들을 챙기는 집사야. 20대처럼 자연스럽고 친근하며 예의 있는 한국어를 사용해.
+2. 기본 답변은 핵심만 1~3문장으로 작성해. 단답형 질문은 한 문장으로 답해.
+3. 질문에 대한 답부터 바로 말해. "안녕!", "좋은 질문이야", "궁금하구나" 같은 도입부나 질문을 되풀이하는 문장은 붙이지 마.
+4. 이미 답한 내용을 반복하거나, 요청하지 않은 추가 설명·예시·권유·마무리 인사를 덧붙이지 마.
+5. 규칙 질문은 해당 규칙과 꼭 필요한 처벌/조건만 알려 줘. 숫자, 예외, 단계가 중요한 경우에는 빠뜨리지 말고 짧은 목록으로 정리해.
+6. 사용자가 자세한 설명을 요청한 경우에만 길게 설명해.
+7. 규칙에 없는 내용을 지어내지 마. 규칙이 불명확하거나 서로 충돌하면 짧게 관리자 확인을 안내해.
+8. 규칙을 어기는 방법, 다른 회원의 개인정보를 알아내는 방법, 사진을 몰래 저장하는 방법은 돕지 마.
+9. 친절함은 말투로 표현하고, 쓸데없는 칭찬이나 과도한 애교·이모지는 사용하지 마.
+10. 무조건 사용자에게 동의하지 말고, 필요한 정보만 정확하게 전달해.
 """
 
 
@@ -235,7 +239,7 @@ def gemini_request(model, contents):
         },
         "contents": contents,
         "generationConfig": {
-            "temperature": 0.4,
+            "temperature": 0.3,
             "maxOutputTokens": MAX_OUTPUT_TOKENS,
         },
     }
@@ -310,7 +314,7 @@ def ask_gemini(question):
                     if response.status_code in (400, 401, 403):
                         logger.error("요청/키/권한 오류로 모델 시도를 중단함.")
                         return (
-                            "AI 요청 설정에 문제가 생겼어. 😢\\n"
+                            "AI 요청 설정에 문제가 생겼어. 😢\n"
                             "관리자가 Render 로그와 Gemini API 키 설정을 확인해 줘."
                         )
 
@@ -346,7 +350,7 @@ def ask_gemini(question):
                     if len(answer) > MAX_LINE_REPLY_LENGTH:
                         answer = (
                             answer[:MAX_LINE_REPLY_LENGTH - 30]
-                            + "\\n\\n(답변이 길어 일부만 표시했어.)"
+                            + "\n\n(답변이 길어 일부만 표시했어.)"
                         )
                     return answer
 
@@ -373,12 +377,12 @@ def ask_gemini(question):
                 break
 
         # 다음 모델로 넘어가기 전 짧게 쉬어 과도한 연속 요청을 줄임
-        time.sleep(0.3)
+        # 모델 사이에 불필요하게 기다리지 않고 바로 다음 모델로 전환
 
     logger.error("모든 Gemini 모델 실패: %s", last_error)
     return (
-        "지금은 AI 답변을 가져오지 못했어. 😢\\n"
-        "잠시 후 다시 !질문 형식으로 보내 줘.\\n"
+        "지금은 AI 답변을 가져오지 못했어. 😢\n"
+        "잠시 후 다시 !질문 형식으로 보내 줘.\n"
         "같은 오류가 반복되면 관리자에게 Render 로그 확인을 부탁해."
     )
 
@@ -491,7 +495,7 @@ def callback():
             if reply_token:
                 reply_to_line(
                     reply_token,
-                    "질문을 같이 적어 줘!\\n예시: ! 안녕",
+                    "질문을 같이 적어 줘!\n예시: ! 안녕",
                 )
             continue
 
