@@ -37,7 +37,8 @@ MAX_OUTPUT_TOKENS = 4096
 MAX_QUESTION_LENGTH = 12000
 MAX_LINE_REPLY_LENGTH = 4500
 
-RETRY_STATUS_CODES = (408, 429, 500, 502, 503, 504)
+RETRY_STATUS_CODES = (408, 500, 502, 503, 504)
+MAX_RETRIES_PER_MODEL = 1  # 모델마다 일시 오류 재시도 횟수
 
 
 SYSTEM_PROMPT = """
@@ -271,7 +272,7 @@ def extract_gemini_text(data):
 
 
 def ask_gemini(question):
-    """모델을 차례대로 시도해 AI 답변을 가져옴."""
+    """모델별로 일시 오류를 한 번 재시도하고, 실패하면 다음 모델로 넘어감."""
     if not GEMINI_API_KEY:
         return "Gemini API 키가 설정되지 않았어. 관리자에게 알려 줘."
 
@@ -287,70 +288,98 @@ def ask_gemini(question):
     for model in GEMINI_MODELS:
         logger.info("Gemini 모델 시도: %s", model)
 
-        try:
-            response = gemini_request(model, contents)
+        for attempt in range(MAX_RETRIES_PER_MODEL + 1):
+            try:
+                response = gemini_request(model, contents)
 
-            if not response.ok:
-                last_error = (
-                    f"HTTP {response.status_code}: {response.text[:1000]}"
-                )
-                logger.warning(
-                    "Gemini 실패: model=%s status=%s body=%s",
-                    model,
-                    response.status_code,
-                    response.text[:1500],
-                )
-
-                # 키나 권한 문제는 모델을 바꿔도 해결되지 않을 수 있음
-                if response.status_code in (400, 401, 403):
-                    break
-
-                # 사용 불가 모델이나 할당량 문제는 다음 모델을 시도
-                if response.status_code in RETRY_STATUS_CODES or response.status_code == 404:
-                    continue
-
-                continue
-
-            data = response.json()
-            answer, finish_reason = extract_gemini_text(data)
-
-            logger.info(
-                "Gemini 결과: model=%s finishReason=%s chars=%s",
-                model,
-                finish_reason,
-                len(answer),
-            )
-
-            if answer:
-                if len(answer) > MAX_LINE_REPLY_LENGTH:
-                    answer = (
-                        answer[:MAX_LINE_REPLY_LENGTH - 30]
-                        + "\n\n(답변이 길어 일부만 표시했어.)"
+                if not response.ok:
+                    last_error = (
+                        f"HTTP {response.status_code}: {response.text[:1000]}"
+                    )
+                    logger.warning(
+                        "Gemini 실패: model=%s attempt=%s/%s status=%s body=%s",
+                        model,
+                        attempt + 1,
+                        MAX_RETRIES_PER_MODEL + 1,
+                        response.status_code,
+                        response.text[:1500],
                     )
 
-                return answer
+                    # 키·요청 형식·권한 문제는 재시도하거나 모델을 바꿔도
+                    # 해결되지 않을 가능성이 높으므로 중단
+                    if response.status_code in (400, 401, 403):
+                        logger.error("요청/키/권한 오류로 모델 시도를 중단함.")
+                        return (
+                            "AI 요청 설정에 문제가 생겼어. 😢\\n"
+                            "관리자가 Render 로그와 Gemini API 키 설정을 확인해 줘."
+                        )
 
-            last_error = (
-                f"{model} 응답에 텍스트가 없어. "
-                f"finishReason={finish_reason}"
-            )
-            logger.warning("%s", last_error)
+                    # 503 등 일시적인 서버 오류는 같은 모델로 한 번 재시도
+                    if response.status_code in RETRY_STATUS_CODES:
+                        if attempt < MAX_RETRIES_PER_MODEL:
+                            delay = 1.5 * (attempt + 1)
+                            logger.info(
+                                "일시 오류 재시도: model=%s wait=%.1fs",
+                                model, delay
+                            )
+                            time.sleep(delay)
+                            continue
+                        # 재시도까지 실패하면 다음 모델로 이동
+                        break
 
-        except requests.RequestException as exc:
-            last_error = str(exc)
-            logger.exception("Gemini 요청 중 네트워크 오류: %s", model)
-        except (ValueError, KeyError, TypeError) as exc:
-            last_error = str(exc)
-            logger.exception("Gemini 응답 처리 오류: %s", model)
+                    # 모델을 찾을 수 없거나 기타 오류면 다음 모델로 이동
+                    if response.status_code == 404:
+                        break
+                    break
 
-        time.sleep(0.5)
+                data = response.json()
+                answer, finish_reason = extract_gemini_text(data)
+
+                logger.info(
+                    "Gemini 결과: model=%s finishReason=%s chars=%s",
+                    model,
+                    finish_reason,
+                    len(answer),
+                )
+
+                if answer:
+                    if len(answer) > MAX_LINE_REPLY_LENGTH:
+                        answer = (
+                            answer[:MAX_LINE_REPLY_LENGTH - 30]
+                            + "\\n\\n(답변이 길어 일부만 표시했어.)"
+                        )
+                    return answer
+
+                last_error = (
+                    f"{model} 응답에 텍스트가 없어. "
+                    f"finishReason={finish_reason}"
+                )
+                logger.warning("%s", last_error)
+                break
+
+            except requests.RequestException as exc:
+                last_error = str(exc)
+                logger.warning(
+                    "Gemini 네트워크 오류: model=%s attempt=%s/%s error=%s",
+                    model, attempt + 1, MAX_RETRIES_PER_MODEL + 1, exc
+                )
+                if attempt < MAX_RETRIES_PER_MODEL:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                break
+            except (ValueError, KeyError, TypeError) as exc:
+                last_error = str(exc)
+                logger.exception("Gemini 응답 처리 오류: %s", model)
+                break
+
+        # 다음 모델로 넘어가기 전 짧게 쉬어 과도한 연속 요청을 줄임
+        time.sleep(0.3)
 
     logger.error("모든 Gemini 모델 실패: %s", last_error)
-
     return (
-        "지금은 AI 답변을 가져오지 못했어. 😢\n"
-        "잠시 후 다시 시도해 줘. 같은 오류가 반복되면 "
-        "Render 로그에서 Gemini 오류 내용을 확인해 줘."
+        "지금은 AI 답변을 가져오지 못했어. 😢\\n"
+        "잠시 후 다시 !질문 형식으로 보내 줘.\\n"
+        "같은 오류가 반복되면 관리자에게 Render 로그 확인을 부탁해."
     )
 
 
@@ -448,21 +477,21 @@ def callback():
                 reply_to_line(reply_token, result)
             continue
 
-        # !ai로 시작하는 메시지만 처리
-        if not text.startswith("!ai"):
+        # ! 로 시작하는 메시지를 AI 질문으로 처리
+        if not text.startswith("!"):
             continue
 
-        # !aimodels는 위에서 별도로 처리
-        if text.startswith("!aimodels"):
-            continue
-
-        question = text[3:].strip()
+        # 예전 명령어 !ai 질문도 호환되도록 유지
+        if text.startswith("!ai "):
+            question = text[3:].strip()
+        else:
+            question = text[1:].strip()
 
         if not question:
             if reply_token:
                 reply_to_line(
                     reply_token,
-                    "질문을 같이 적어 줘!\n예시: !ai 안녕",
+                    "질문을 같이 적어 줘!\\n예시: ! 안녕",
                 )
             continue
 
@@ -475,7 +504,6 @@ def callback():
             continue
 
         logger.info("AI 질문 수신: chars=%s", len(question))
-
         answer = ask_gemini(question)
 
         if reply_token:
