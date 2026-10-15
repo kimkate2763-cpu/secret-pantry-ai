@@ -62,9 +62,18 @@ def callback():
         if not question:
             answer = "무엇이 궁금해? !AI 뒤에 질문을 적어 줘!"
         else:
+            
+            except Exception:
+                app.logger.exception("Gemini response failed")
+                answer = "잠깐 오류가 났어. 조금 뒤에 다시 물어봐 줘!"
+
+        reply_token = event.get("replyToken")
+        if not reply_token:
+            continue
+
+       
             try:
-                
-                  response = requests.post(
+                response = requests.post(
                     "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
                     headers={
                         "x-goog-api-key": GEMINI_API_KEY,
@@ -83,20 +92,10 @@ def callback():
                     },
                     timeout=25
                 )
-
                 response.raise_for_status()
                 data = response.json()
                 answer = data["candidates"][0]["content"]["parts"][0]["text"]
 
-            except Exception:
-                app.logger.exception("Gemini response failed")
-                answer = "잠깐 오류가 났어. 조금 뒤에 다시 물어봐 줘!"
-
-        reply_token = event.get("replyToken")
-        if not reply_token:
-            continue
-
-        try:
             line_response = requests.post(
                 "https://api.line.me/v2/bot/message/reply",
                 headers={
