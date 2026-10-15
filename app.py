@@ -15,15 +15,10 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 SYSTEM_PROMPT = """
 너는 시크릿 펜트리 단체방에서 활동하는 친근한 AI 친구야.
-
-- 항상 자연스럽고 편안한 한국어로 대화해.
-- 친절하고 재치 있게 답변하되, 지나치게 길게 말하지 마.
-- 질문의 의도를 파악하고 이해하기 쉽게 설명해.
-- 모르는 내용은 아는 척하지 말고 솔직하게 말해.
-- 사용자가 장난을 치면 분위기에 맞춰 자연스럽게 받아줘.
-- 사용자가 고민을 이야기하면 공감하면서 현실적인 조언을 해줘.
-- 확인할 수 없는 단체방 대화나 개인 정보를 알고 있는 척하지 마.
-- 특별한 요청이 없으면 간결하게 답변해.
+항상 자연스럽고 편안한 한국어로 대화해.
+친절하고 재치 있게 답변하되 지나치게 길게 말하지 마.
+모르는 내용은 아는 척하지 말고 솔직하게 말해.
+사용자가 고민을 이야기하면 공감하며 현실적인 조언을 해줘.
 """
 
 GEMINI_URL = (
@@ -39,10 +34,34 @@ def home():
     return "Secret Pantry AI is running!"
 
 
-def ask_gemini(question):
-    """일시적인 오류가 발생하면 최대 3번 요청한다."""
+def get_available_models():
+    """현재 API 키로 조회 가능한 모델 중 텍스트 생성 지원 모델을 반환한다."""
+    response = requests.get(
+        "https://generativelanguage.googleapis.com/v1beta/models",
+        headers={"x-goog-api-key": GEMINI_API_KEY},
+        params={"pageSize": 100},
+        timeout=15,
+    )
+    response.raise_for_status()
 
+    data = response.json()
+    names = []
+
+    for model in data.get("models", []):
+        methods = model.get("supportedGenerationMethods", [])
+        name = model.get("name", "")
+
+        if "generateContent" in methods and name:
+            names.append(name)
+
+    return names
+
+
+def ask_gemini(question):
+    """일시적인 서버 오류에 최대 3번까지 재시도한다."""
     for attempt in range(3):
+        response = None
+
         try:
             response = requests.post(
                 GEMINI_URL,
@@ -61,16 +80,14 @@ def ask_gemini(question):
                         "maxOutputTokens": 500
                     },
                 },
-                timeout=12,
+                timeout=20,
             )
 
-            # 일시적인 서버 오류라면 잠시 기다렸다가 재시도
             if response.status_code in RETRY_STATUS_CODES:
                 if attempt < 2:
-                    wait_seconds = 2 ** attempt
+                    wait_seconds = 2 ** (attempt + 1)
                     app.logger.warning(
-                        "Gemini 일시 오류: HTTP %s. "
-                        "%s초 후 재시도합니다. (%s/3)",
+                        "Gemini HTTP %s 오류. %s초 후 재시도 (%s/3)",
                         response.status_code,
                         wait_seconds,
                         attempt + 1,
@@ -78,9 +95,7 @@ def ask_gemini(question):
                     time.sleep(wait_seconds)
                     continue
 
-            # 재시도로 해결되지 않은 오류 확인
             response.raise_for_status()
-
             data = response.json()
             candidates = data.get("candidates", [])
 
@@ -89,7 +104,7 @@ def ask_gemini(question):
                     "Gemini 응답에 candidates가 없습니다: %s",
                     response.text[:1000],
                 )
-                return "답변을 만들지 못했어. 질문을 조금 바꿔서 다시 물어봐 줘!"
+                return "이번에는 답변을 만들지 못했어. 다시 물어봐 줘!"
 
             parts = candidates[0].get("content", {}).get("parts", [])
             answer = "".join(
@@ -98,18 +113,13 @@ def ask_gemini(question):
                 if part.get("text")
             ).strip()
 
-            if not answer:
-                return "이번에는 답변을 만들지 못했어. 다시 물어봐 줘!"
-
-            return answer
+            return answer or "이번에는 답변을 만들지 못했어. 다시 물어봐 줘!"
 
         except (requests.Timeout, requests.ConnectionError):
-            app.logger.exception(
-                "Gemini 연결 오류 (%s/3)", attempt + 1
-            )
+            app.logger.exception("Gemini 연결 오류 (%s/3)", attempt + 1)
 
             if attempt < 2:
-                time.sleep(2 ** attempt)
+                time.sleep(2 ** (attempt + 1))
                 continue
 
             raise
@@ -145,27 +155,46 @@ def callback():
             continue
 
         text = message.get("text", "").strip()
-
-        # !AI로 시작하는 메시지에만 응답
-        if not text.lower().startswith("!ai"):
+        if not text:
             continue
 
-        question = text[3:].strip()
-
-        if not question:
-            answer = "무엇이 궁금해? !AI 뒤에 질문을 적어 줘!"
-        else:
+        if text.lower() == "!aimodels":
             try:
-                answer = ask_gemini(question)
+                models = get_available_models()
+
+                if models:
+                    answer = (
+                        "현재 조회 가능한 텍스트 생성 모델 목록:\n"
+                        + "\n".join(models[:30])
+                    )
+                else:
+                    answer = "텍스트 생성 지원 모델을 찾지 못했어."
+
             except Exception:
-                app.logger.exception("Gemini 응답 최종 실패")
+                app.logger.exception("Gemini 모델 목록 조회 실패")
                 answer = (
-                    "구글 AI가 지금 답변을 처리하지 못하고 있어. "
-                    "잠시 후 다시 물어봐 줘!"
+                    "모델 목록 조회에 실패했어. "
+                    "Render 로그에서 오류를 확인해 줘."
                 )
 
-        reply_token = event.get("replyToken")
+        elif text.lower().startswith("!ai"):
+            question = text[3:].strip()
 
+            if not question:
+                answer = "무엇이 궁금해? !AI 뒤에 질문을 적어 줘!"
+            else:
+                try:
+                    answer = ask_gemini(question)
+                except Exception:
+                    app.logger.exception("Gemini 응답 최종 실패")
+                    answer = (
+                        "구글 AI가 지금 답변을 처리하지 못하고 있어. "
+                        "잠시 후 다시 물어봐 줘!"
+                    )
+        else:
+            continue
+
+        reply_token = event.get("replyToken")
         if not reply_token:
             continue
 
@@ -189,7 +218,6 @@ def callback():
                 },
                 timeout=10,
             )
-
             line_response.raise_for_status()
 
         except requests.RequestException:
