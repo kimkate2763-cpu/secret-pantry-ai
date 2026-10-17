@@ -1,3 +1,4 @@
 flask
 requests
 gunicorn
+psycopg[binary]>=3.2,<4
