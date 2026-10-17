@@ -5,7 +5,8 @@ import hashlib
 import logging
 import time
 import random
-import sqlite3
+import psycopg
+from psycopg.rows import dict_row
 import re
 
 from datetime import datetime
@@ -32,30 +33,25 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# 마딧수 데이터베이스
-# Render 영구 디스크를 /var/data에 연결했다면 DATABASE_PATH를
-# /var/data/secret_pantry_messages.db 로 설정하는 것을 권장해.
-DATABASE_PATH = os.getenv(
-    "DATABASE_PATH",
-    "secret_pantry_messages.db",
-)
+# 마딧수 데이터베이스: Render 환경변수 DATABASE_URL의 Neon PostgreSQL 사용
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 KST = ZoneInfo("Asia/Seoul")
 
 
 @contextmanager
 def get_db():
-    """SQLite 연결을 안전하게 열고 닫는다."""
-    conn = sqlite3.connect(DATABASE_PATH, timeout=15)
-    conn.row_factory = sqlite3.Row
+    """PostgreSQL 연결을 안전하게 열고 닫는다."""
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL 환경변수가 없습니다. Render Environment를 확인해 주세요."
+        )
 
-    try:
+    with psycopg.connect(
+        DATABASE_URL,
+        connect_timeout=15,
+        row_factory=dict_row,
+    ) as conn:
         yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
 
 
 def init_message_database():
@@ -100,7 +96,7 @@ def get_member_display_name(group_id, user_id):
             """
             SELECT display_name
             FROM member_profiles
-            WHERE group_id = ? AND user_id = ?
+            WHERE group_id = %s AND user_id = %s
             """,
             (group_id, user_id),
         ).fetchone()
@@ -156,7 +152,7 @@ def get_member_display_name(group_id, user_id):
             """
             INSERT INTO member_profiles
                 (group_id, user_id, display_name)
-            VALUES (?, ?, ?)
+            VALUES (%s, %s, %s)
             ON CONFLICT(group_id, user_id)
             DO UPDATE SET display_name = excluded.display_name
             """,
@@ -208,9 +204,10 @@ def record_group_message(event, message):
         with get_db() as conn:
             cursor = conn.execute(
                 """
-                INSERT OR IGNORE INTO message_events
+                INSERT INTO message_events
                     (event_id, group_id, user_id, display_name, message_date)
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (event_id) DO NOTHING
                 """,
                 (
                     str(event_id),
@@ -229,7 +226,7 @@ def record_group_message(event, message):
                 display_name,
             )
 
-    except sqlite3.Error:
+    except psycopg.Error:
         logger.exception("마딧수 메시지 저장 실패")
 
 
@@ -243,12 +240,12 @@ def get_message_ranking(group_id, start_date, end_date):
                 MAX(display_name) AS display_name,
                 COUNT(*) AS message_count
             FROM message_events
-            WHERE group_id = ?
-              AND message_date >= ?
-              AND message_date <= ?
+            WHERE group_id = %s
+              AND message_date >= %s
+              AND message_date <= %s
             GROUP BY user_id
             ORDER BY message_count DESC,
-                     display_name COLLATE NOCASE ASC
+                     LOWER(display_name) ASC
             LIMIT 50
             """,
             (group_id, start_date, end_date),
@@ -327,9 +324,9 @@ def handle_message_count_command(text, group_id):
             SELECT COUNT(*) AS total_messages,
                    COUNT(DISTINCT user_id) AS participant_count
             FROM message_events
-            WHERE group_id = ?
-              AND message_date >= ?
-              AND message_date <= ?
+            WHERE group_id = %s
+              AND message_date >= %s
+              AND message_date <= %s
             """,
             (group_id, start_date, end_date),
         ).fetchone()
