@@ -86,7 +86,17 @@ def init_message_database():
             )
         """)
 
-    logger.info("마딧수 데이터베이스 초기화 완료")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS member_titles (
+                group_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                title_name TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (group_id, user_id)
+            )
+        """)
+
+    logger.info("마딧수 및 업적·칭호 데이터베이스 초기화 완료")
 
 
 def get_member_display_name(group_id, user_id):
@@ -361,6 +371,147 @@ def handle_message_count_command(text, group_id):
         "※ 순위는 최대 50명까지 표시돼.",
     ])
     return "\n".join(lines)
+
+
+# 업적·칭호 시스템: 매월 1일 초기화되는 월간 메시지 수 기준
+ACHIEVEMENT_DEFINITIONS = [
+    {"title": "첫 발자국", "threshold": 1,
+     "description": "이번 달 메시지 1개를 기록했어"},
+    {"title": "수다 새싹", "threshold": 100,
+     "description": "이번 달 메시지 100개를 기록했어"},
+    {"title": "펜트리 단골", "threshold": 500,
+     "description": "이번 달 메시지 500개를 기록했어"},
+    {"title": "공창 수다왕", "threshold": 1000,
+     "description": "이번 달 메시지 1,000개를 기록했어"},
+    {"title": "만마디의 주인", "threshold": 10000,
+     "description": "이번 달 메시지 10,000개를 기록했어"},
+    {"title": "이만마디의 전설", "threshold": 20000,
+     "description": "이번 달 메시지 20,000개를 기록했어"},
+    {"title": "삼만마디의 지배자", "threshold": 30000,
+     "description": "이번 달 메시지 30,000개를 기록했어"},
+    {"title": "사만마디의 화신", "threshold": 40000,
+     "description": "이번 달 메시지 40,000개를 기록했어"},
+    {"title": "오만마디의 제왕", "threshold": 50000,
+     "description": "이번 달 메시지 50,000개를 기록했어"},
+    {"title": "육만마디의 신", "threshold": 60000,
+     "description": "이번 달 메시지 60,000개를 기록했어"},
+    {"title": "칠만마디의 초월자", "threshold": 70000,
+     "description": "이번 달 메시지 70,000개를 기록했어"},
+    {"title": "팔만마디의 정점", "threshold": 80000,
+     "description": "이번 달 메시지 80,000개를 기록했어"},
+    {"title": "구만마디의 절대자", "threshold": 90000,
+     "description": "이번 달 메시지 90,000개를 기록했어"},
+    {"title": "십만마디의 전설", "threshold": 100000,
+     "description": "이번 달 메시지 100,000개를 기록했어"},
+]
+
+
+def get_member_achievement_stats(group_id, user_id):
+    """이번 달 1일부터 오늘까지 해당 회원이 기록한 메시지 수를 조회한다."""
+    today = datetime.now(KST).date()
+    month_start = today.replace(day=1).isoformat()
+    today_text = today.isoformat()
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS total_messages
+            FROM message_events
+            WHERE group_id = %s AND user_id = %s
+              AND message_date >= %s AND message_date <= %s
+            """,
+            (group_id, user_id, month_start, today_text),
+        ).fetchone()
+    return {"total_messages": int(row["total_messages"] or 0),
+            "month_start": month_start, "today": today_text}
+
+
+def get_equipped_title(group_id, user_id):
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT title_name FROM member_titles
+            WHERE group_id = %s AND user_id = %s
+            """,
+            (group_id, user_id),
+        ).fetchone()
+    return row["title_name"] if row else ""
+
+
+def set_equipped_title(group_id, user_id, title_name):
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO member_titles (group_id, user_id, title_name, updated_at)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (group_id, user_id)
+            DO UPDATE SET title_name = EXCLUDED.title_name,
+                          updated_at = NOW()
+            """,
+            (group_id, user_id, title_name),
+        )
+
+
+def get_unlocked_titles(stats):
+    """이번 달 메시지 수에 따라 해금된 칭호를 반환한다."""
+    return [item for item in ACHIEVEMENT_DEFINITIONS
+            if stats["total_messages"] >= item["threshold"]]
+
+
+def handle_achievement_command(text, group_id, user_id, display_name):
+    """업적 확인, 칭호 확인 및 칭호 장착 명령어를 처리한다."""
+    if not group_id or not user_id:
+        return "업적과 칭호는 단체방에서만 확인할 수 있어. 🐈"
+
+    stats = get_member_achievement_stats(group_id, user_id)
+    unlocked = get_unlocked_titles(stats)
+    unlocked_names = [item["title"] for item in unlocked]
+    equipped = get_equipped_title(group_id, user_id)
+
+    if text == "*내업적":
+        lines = [
+            f"🏅 {display_name}의 업적",
+            f"📆 집계 기간: {stats['month_start']} ~ {stats['today']}",
+            f"💬 이번 달 메시지: {stats['total_messages']:,}개",
+            "",
+            "🔓 이번 달 해금한 칭호",
+        ]
+        if unlocked:
+            for item in unlocked:
+                marker = "👑 " if item["title"] == equipped else "• "
+                lines.append(f"{marker}{item['title']} — {item['description']}")
+        else:
+            lines.append("이번 달 해금한 칭호가 없어. 메시지를 남겨 봐!")
+        lines.extend([
+            "",
+            "칭호 장착: *칭호 칭호이름",
+            "칭호 해제: *칭호 해제",
+        ])
+        return "\n".join(lines)
+
+    if text == "*내칭호":
+        if equipped and equipped in unlocked_names:
+            return f"🎖️ 현재 {display_name}의 칭호는 [{equipped}] 이야!"
+        if equipped:
+            return "지난달 장착한 칭호는 이번 달 아직 해금되지 않았어. *내업적에서 확인해 봐!"
+        return "아직 장착한 칭호가 없어. *내업적에서 이번 달 해금한 칭호를 확인해 봐!"
+
+    requested = text[len("*칭호"):].strip()
+    if not requested:
+        return "사용법: *칭호 칭호이름\n장착 해제: *칭호 해제"
+
+    if requested in ("해제", "없음", "끄기"):
+        set_equipped_title(group_id, user_id, "")
+        return "칭호를 해제했어. 필요할 때 언제든 다시 장착할 수 있어!"
+
+    if requested not in [item["title"] for item in ACHIEVEMENT_DEFINITIONS]:
+        names = ", ".join(item["title"] for item in ACHIEVEMENT_DEFINITIONS)
+        return f"그런 칭호는 아직 없어. 칭호 목록: {names}"
+
+    if requested not in unlocked_names:
+        return f"아직 [{requested}] 칭호를 해금하지 못했어. *내업적에서 조건을 확인해 봐!"
+
+    set_equipped_title(group_id, user_id, requested)
+    return f"✨ [{requested}] 칭호 장착 완료!\n앞으로 집사가 네 대표 칭호로 기억할게."
 
 
 # 데이터베이스 테이블을 앱 시작 시 준비한다.
@@ -1264,6 +1415,15 @@ def callback():
         reply_token = event.get("replyToken")
         source = event.get("source", {})
         group_id = source.get("groupId") or source.get("roomId")
+
+        # 업적·칭호 시스템
+        if text in ("*내업적", "*내칭호") or text.startswith("*칭호"):
+            user_id = source.get("userId")
+            display_name = get_member_display_name(group_id, user_id) if group_id and user_id else "회원"
+            result = handle_achievement_command(text, group_id, user_id, display_name)
+            if reply_token:
+                reply_to_line(reply_token, result)
+            continue
 
         # 오늘·주간·월간·기간별 마딧수
         if text in ("*마딧수", "*주간순위", "*월간결산") or (
