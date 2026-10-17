@@ -245,7 +245,7 @@ def get_message_ranking(group_id, start_date, end_date):
               AND message_date <= %s
             GROUP BY user_id
             ORDER BY message_count DESC,
-                     LOWER(display_name) ASC
+                     LOWER(MAX(display_name)) ASC
             LIMIT 50
             """,
             (group_id, start_date, end_date),
