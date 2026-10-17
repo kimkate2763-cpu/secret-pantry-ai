@@ -258,14 +258,38 @@ def get_message_ranking(group_id, start_date, end_date):
 
 
 def handle_message_count_command(text, group_id):
-    """마딧수 명령어를 처리한다. 해당 명령어가 아니면 None을 반환한다."""
+    """오늘·주간·월간·기간별 마딧수와 전체 통계를 반환한다."""
+    from datetime import timedelta
+
     text = text.strip()
-    today = datetime.now(KST).date().isoformat()
+    today = datetime.now(KST).date()
+
+    if not group_id:
+        return "마딧수는 단체방에서만 확인할 수 있어."
 
     if text == "*마딧수":
-        start_date = today
-        end_date = today
-        title = f"오늘의 마딧수 ({today})"
+        start = today
+        end = today
+        title = f"오늘의 마딧수 ({start})"
+
+    elif text == "*주간순위":
+        # 월요일 00:00부터 일요일 23:59까지 (한국 시간 기준 날짜)
+        start = today - timedelta(days=today.weekday())
+        end = start + timedelta(days=6)
+        title = f"주간 마딧수 ({start} ~ {end})"
+
+    elif text == "*월간결산":
+        start = today.replace(day=1)
+        if today.month == 12:
+            next_month = today.replace(
+                year=today.year + 1, month=1, day=1
+            )
+        else:
+            next_month = today.replace(
+                month=today.month + 1, day=1
+            )
+        end = next_month - timedelta(days=1)
+        title = f"월간 활동 결산 ({start} ~ {end})"
 
     else:
         match = re.fullmatch(
@@ -273,20 +297,16 @@ def handle_message_count_command(text, group_id):
             r"(\d{4}-\d{2}-\d{2})\s*마딧수",
             text,
         )
-
         if not match:
             return None
 
-        start_date, end_date = match.groups()
-
         try:
             start = datetime.strptime(
-                start_date, "%Y-%m-%d"
+                match.group(1), "%Y-%m-%d"
             ).date()
             end = datetime.strptime(
-                end_date, "%Y-%m-%d"
+                match.group(2), "%Y-%m-%d"
             ).date()
-
         except ValueError:
             return (
                 "날짜 형식이 올바르지 않아.\n"
@@ -295,42 +315,54 @@ def handle_message_count_command(text, group_id):
 
         if start > end:
             return "시작 날짜가 종료 날짜보다 늦어. 날짜를 다시 확인해 줘."
+        title = f"기간별 마딧수 ({start} ~ {end})"
 
-        title = f"기간별 마딧수 ({start_date} ~ {end_date})"
+    start_date = start.isoformat()
+    end_date = end.isoformat()
 
-    if not group_id:
-        return "마딧수는 단체방에서만 확인할 수 있어."
+    # 전체 회원을 기준으로 총 메시지와 참여 인원을 별도 집계한다.
+    with get_db() as conn:
+        summary = conn.execute(
+            """
+            SELECT COUNT(*) AS total_messages,
+                   COUNT(DISTINCT user_id) AS participant_count
+            FROM message_events
+            WHERE group_id = ?
+              AND message_date >= ?
+              AND message_date <= ?
+            """,
+            (group_id, start_date, end_date),
+        ).fetchone()
 
-    rows = get_message_ranking(
-        group_id,
-        start_date,
-        end_date,
-    )
-
-    if not rows:
-        return (
-            f"📊 {title}\n\n"
-            "아직 집계된 메시지가 없어.\n"
-            "마딧수 기능을 적용한 이후의 메시지부터 집계돼."
-        )
+    # 순위 표시는 기존처럼 최대 50명으로 제한한다.
+    rows = get_message_ranking(group_id, start_date, end_date)
+    total_messages = summary["total_messages"]
+    participant_count = summary["participant_count"]
 
     lines = [
         f"📊 {title}",
+        f"💬 총 메시지: {total_messages:,}개",
+        f"👥 참여 인원: {participant_count:,}명",
         "",
     ]
 
+    if not rows:
+        lines.append("아직 집계된 메시지가 없어.")
+        lines.append("집사에 기록된 메시지부터 집계돼.")
+        return "\n".join(lines)
+
+    lines.append("🏆 활동 순위")
     for rank, row in enumerate(rows, start=1):
         lines.append(
             f"{rank}. {row['display_name']} — "
-            f"{row['message_count']}마디"
+            f"{row['message_count']:,}마디"
         )
 
     lines.extend([
         "",
-        "※ 봇에 집계 기능을 적용한 이후의 메시지만 포함돼.",
-        "※ 현재 순위는 최대 50명까지 표시돼.",
+        "※ 집사에 기록된 메시지만 집계돼.",
+        "※ 순위는 최대 50명까지 표시돼.",
     ])
-
     return "\n".join(lines)
 
 
@@ -791,6 +823,8 @@ def handle_quick_command(question):
             "• ! 용어집 또는 ! 용어집 단어 — 방 용어 확인\n"
             "• !aimodels — 사용 가능한 AI 모델 확인\n"
             "• *마딧수 — 오늘의 메시지 순위\n"
+            "• *주간순위 — 이번 주 월~일 순위와 통계\n"
+            "• *월간결산 — 이번 달 순위와 통계\n"
             "• *YYYY-MM-DD~YYYY-MM-DD 마딧수 — 기간별 순위\n"
             "그 외 질문은 ! 질문 형식으로 물어봐 줘."
         )
@@ -1234,8 +1268,8 @@ def callback():
         source = event.get("source", {})
         group_id = source.get("groupId") or source.get("roomId")
 
-        # 오늘의 마딧수 및 기간별 마딧수
-        if text == "*마딧수" or (
+        # 오늘·주간·월간·기간별 마딧수
+        if text in ("*마딧수", "*주간순위", "*월간결산") or (
             text.startswith("*") and text.endswith("마딧수")
         ):
             result = handle_message_count_command(text, group_id)
