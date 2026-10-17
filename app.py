@@ -5,7 +5,12 @@ import hashlib
 import logging
 import time
 import random
+import sqlite3
+import re
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from contextlib import contextmanager
 from collections import defaultdict
 from threading import Lock
 
@@ -18,70 +23,369 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("secret-pantry-ai")
 
 MAX_HISTORY_TURNS = 10
-
 conversation_histories = defaultdict(list)
-
 history_lock = Lock()
-
-def get_conversation_key(event):
-
-    """같은 사람의 대화는 이어가되, 다른 사람과 기록이 섞이지 않게 한다."""
-
-    source = event.get("source", {})
-
-    user_id = source.get("userId")
-
-    if not user_id:
-
-        return None
-
-    group_id = source.get("groupId") or source.get("roomId") or "direct"
-
-    return f"{group_id}:{user_id}"
-
-def get_history(key):
-
-    """저장된 대화 기록을 복사해서 반환한다."""
-
-    if not key:
-
-        return []
-
-    with history_lock:
-
-        return list(conversation_histories[key])
-
-def save_history(key, question, answer):
-
-    """질문과 답변을 함께 저장하고 오래된 기록은 정리한다."""
-
-    if not key:
-
-        return
-
-    with history_lock:
-
-        history = conversation_histories[key]
-
-        history.append({"role": "user", "parts": [{"text": question}]})
-
-        history.append({"role": "model", "parts": [{"text": answer}]})
-
-        del history[:-MAX_HISTORY_TURNS * 2]
 
 # 환경변수: Render 대시보드에서 설정
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
+# 마딧수 데이터베이스
+# Render 영구 디스크를 /var/data에 연결했다면 DATABASE_PATH를
+# /var/data/secret_pantry_messages.db 로 설정하는 것을 권장해.
+DATABASE_PATH = os.getenv(
+    "DATABASE_PATH",
+    "secret_pantry_messages.db",
+)
+KST = ZoneInfo("Asia/Seoul")
+
+
+@contextmanager
+def get_db():
+    """SQLite 연결을 안전하게 열고 닫는다."""
+    conn = sqlite3.connect(DATABASE_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_message_database():
+    """메시지 기록과 회원 닉네임을 저장할 테이블을 준비한다."""
+    with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS message_events (
+                event_id TEXT PRIMARY KEY,
+                group_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                message_date TEXT NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_message_group_date
+            ON message_events (group_id, message_date)
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_message_group_user_date
+            ON message_events (group_id, user_id, message_date)
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS member_profiles (
+                group_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                PRIMARY KEY (group_id, user_id)
+            )
+        """)
+
+    logger.info("마딧수 데이터베이스 초기화 완료")
+
+
+def get_member_display_name(group_id, user_id):
+    """저장된 닉네임을 사용하고, 없으면 LINE 프로필을 조회한다."""
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT display_name
+            FROM member_profiles
+            WHERE group_id = ? AND user_id = ?
+            """,
+            (group_id, user_id),
+        ).fetchone()
+
+    if row:
+        return row["display_name"]
+
+    fallback_name = user_id[-6:]
+
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        return fallback_name
+
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
+    }
+
+    try:
+        if group_id.startswith("C"):
+            url = (
+                "https://api.line.me/v2/bot/group/"
+                f"{group_id}/member/{user_id}"
+            )
+        elif group_id.startswith("R"):
+            url = (
+                "https://api.line.me/v2/bot/room/"
+                f"{group_id}/member/{user_id}"
+            )
+        else:
+            url = f"https://api.line.me/v2/bot/profile/{user_id}"
+
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=10,
+        )
+
+        if response.ok:
+            profile = response.json()
+            display_name = profile.get("displayName") or fallback_name
+        else:
+            logger.warning(
+                "LINE 닉네임 조회 실패: HTTP %s",
+                response.status_code,
+            )
+            display_name = fallback_name
+
+    except requests.RequestException:
+        logger.exception("LINE 닉네임 조회 중 오류")
+        display_name = fallback_name
+
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO member_profiles
+                (group_id, user_id, display_name)
+            VALUES (?, ?, ?)
+            ON CONFLICT(group_id, user_id)
+            DO UPDATE SET display_name = excluded.display_name
+            """,
+            (group_id, user_id, display_name),
+        )
+
+    return display_name
+
+
+def record_group_message(event, message):
+    """단체방 메시지를 기록한다. 중복 웹훅은 한 번만 집계한다."""
+    source = event.get("source", {})
+    group_id = source.get("groupId") or source.get("roomId")
+    user_id = source.get("userId")
+
+    # 개인 채팅은 마딧수 집계에서 제외한다.
+    if not group_id or not user_id:
+        return
+
+    # LINE의 웹훅 이벤트 ID를 우선 사용해 재전송을 중복 처리하지 않는다.
+    # 이벤트 ID가 없으면 메시지 ID를 사용한다.
+    message_id = message.get("id")
+    event_id = event.get("webhookEventId") or message_id
+
+    # 둘 다 없는 경우를 위한 최후의 중복 방지용 식별자
+    if not event_id:
+        event_id = hashlib.sha256(
+            (
+                str(group_id)
+                + str(user_id)
+                + str(event.get("timestamp", ""))
+                + str(message.get("type", ""))
+            ).encode("utf-8")
+        ).hexdigest()
+
+    timestamp = event.get("timestamp")
+
+    if timestamp:
+        message_date = datetime.fromtimestamp(
+            timestamp / 1000,
+            tz=KST,
+        ).date().isoformat()
+    else:
+        message_date = datetime.now(KST).date().isoformat()
+
+    display_name = get_member_display_name(group_id, user_id)
+
+    try:
+        with get_db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO message_events
+                    (event_id, group_id, user_id, display_name, message_date)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(event_id),
+                    group_id,
+                    user_id,
+                    display_name,
+                    message_date,
+                ),
+            )
+
+        if cursor.rowcount == 1:
+            logger.info(
+                "마딧수 기록: group=%s date=%s member=%s",
+                group_id,
+                message_date,
+                display_name,
+            )
+
+    except sqlite3.Error:
+        logger.exception("마딧수 메시지 저장 실패")
+
+
+def get_message_ranking(group_id, start_date, end_date):
+    """기간 내 회원별 메시지 수를 내림차순으로 반환한다."""
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                user_id,
+                MAX(display_name) AS display_name,
+                COUNT(*) AS message_count
+            FROM message_events
+            WHERE group_id = ?
+              AND message_date >= ?
+              AND message_date <= ?
+            GROUP BY user_id
+            ORDER BY message_count DESC,
+                     display_name COLLATE NOCASE ASC
+            LIMIT 50
+            """,
+            (group_id, start_date, end_date),
+        ).fetchall()
+
+    return rows
+
+
+def handle_message_count_command(text, group_id):
+    """마딧수 명령어를 처리한다. 해당 명령어가 아니면 None을 반환한다."""
+    text = text.strip()
+    today = datetime.now(KST).date().isoformat()
+
+    if text == "*마딧수":
+        start_date = today
+        end_date = today
+        title = f"오늘의 마딧수 ({today})"
+
+    else:
+        match = re.fullmatch(
+            r"\*(\d{4}-\d{2}-\d{2})\s*~\s*"
+            r"(\d{4}-\d{2}-\d{2})\s*마딧수",
+            text,
+        )
+
+        if not match:
+            return None
+
+        start_date, end_date = match.groups()
+
+        try:
+            start = datetime.strptime(
+                start_date, "%Y-%m-%d"
+            ).date()
+            end = datetime.strptime(
+                end_date, "%Y-%m-%d"
+            ).date()
+
+        except ValueError:
+            return (
+                "날짜 형식이 올바르지 않아.\n"
+                "예시: *2026-10-01~2026-10-17 마딧수"
+            )
+
+        if start > end:
+            return "시작 날짜가 종료 날짜보다 늦어. 날짜를 다시 확인해 줘."
+
+        title = f"기간별 마딧수 ({start_date} ~ {end_date})"
+
+    if not group_id:
+        return "마딧수는 단체방에서만 확인할 수 있어."
+
+    rows = get_message_ranking(
+        group_id,
+        start_date,
+        end_date,
+    )
+
+    if not rows:
+        return (
+            f"📊 {title}\n\n"
+            "아직 집계된 메시지가 없어.\n"
+            "마딧수 기능을 적용한 이후의 메시지부터 집계돼."
+        )
+
+    lines = [
+        f"📊 {title}",
+        "",
+    ]
+
+    for rank, row in enumerate(rows, start=1):
+        lines.append(
+            f"{rank}. {row['display_name']} — "
+            f"{row['message_count']}마디"
+        )
+
+    lines.extend([
+        "",
+        "※ 봇에 집계 기능을 적용한 이후의 메시지만 포함돼.",
+        "※ 현재 순위는 최대 50명까지 표시돼.",
+    ])
+
+    return "\n".join(lines)
+
+
+# 데이터베이스 테이블을 앱 시작 시 준비한다.
+init_message_database()
+
+
+def get_conversation_key(event):
+    """같은 사람의 대화는 이어가되, 다른 사람과 기록이 섞이지 않게 한다."""
+    source = event.get("source", {})
+    user_id = source.get("userId")
+
+    if not user_id:
+        return None
+
+    group_id = source.get("groupId") or source.get("roomId") or "direct"
+    return f"{group_id}:{user_id}"
+
+
+def get_history(key):
+    """저장된 대화 기록을 복사해서 반환한다."""
+    if not key:
+        return []
+
+    with history_lock:
+        return list(conversation_histories[key])
+
+
+def save_history(key, question, answer):
+    """질문과 답변을 저장하고 오래된 기록은 정리한다."""
+    if not key:
+        return
+
+    with history_lock:
+        history = conversation_histories[key]
+
+        history.append({
+            "role": "user",
+            "parts": [{"text": question}],
+        })
+
+        history.append({
+            "role": "model",
+            "parts": [{"text": answer}],
+        })
+
+        del history[:-MAX_HISTORY_TURNS * 2]
 
 
 def search_web(query):
     """Tavily 검색 결과와 실패 원인을 로그에 기록한다."""
-
     if not TAVILY_API_KEY:
-        logger.error("Tavily 검색 중단: TAVILY_API_KEY가 설정되지 않음")
+        logger.error(
+            "Tavily 검색 중단: TAVILY_API_KEY가 설정되지 않음"
+        )
         return "인터넷 검색 기능이 설정되지 않았어요."
 
     try:
@@ -101,7 +405,10 @@ def search_web(query):
             timeout=15,
         )
 
-        logger.info("Tavily 응답 상태: HTTP %s", response.status_code)
+        logger.info(
+            "Tavily 응답 상태: HTTP %s",
+            response.status_code,
+        )
         response.raise_for_status()
 
         data = response.json()
@@ -127,14 +434,23 @@ def search_web(query):
                 )
 
         if not results:
-            logger.warning("Tavily가 요약과 검색 결과를 모두 반환하지 않음")
+            logger.warning(
+                "Tavily가 요약과 검색 결과를 모두 반환하지 않음"
+            )
             return "검색 결과를 찾지 못했어요."
 
-        logger.info("Tavily 검색 성공: 전달할 자료 수=%s", len(results))
+        logger.info(
+            "Tavily 검색 성공: 전달할 자료 수=%s",
+            len(results),
+        )
         return "\n\n".join(results)
 
     except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else "unknown"
+        status = (
+            exc.response.status_code
+            if exc.response is not None
+            else "unknown"
+        )
         logger.exception("Tavily HTTP 오류: status=%s", status)
         return f"인터넷 검색 API에서 HTTP {status} 오류가 발생했어요."
 
@@ -146,9 +462,9 @@ def search_web(query):
         logger.exception("Tavily 응답 JSON 처리 실패")
         return "인터넷 검색 응답을 처리하지 못했어요."
 
+
 def needs_web_search(question):
     """인터넷 검색이 필요한 질문인지 판단한다."""
-
     keywords = [
         "날씨", "기온", "미세먼지", "환율",
         "오늘", "현재", "최신", "최근", "요즘",
@@ -160,9 +476,8 @@ def needs_web_search(question):
 
     return any(word in question.lower() for word in keywords)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# 빠른 모델을 우선 시도하고, 실패하면 대체 모델로 전환
+# 빠른 모델을 우선 시도하고 실패하면 대체 모델로 전환
 # 실제 사용 가능 여부는 API 키에 따라 다를 수 있음
 GEMINI_MODELS = [
     "gemini-3.5-flash-lite",
@@ -182,7 +497,7 @@ MAX_QUESTION_LENGTH = 12000
 MAX_LINE_REPLY_LENGTH = 4500
 
 RETRY_STATUS_CODES = (408, 500, 502, 503, 504)
-MAX_RETRIES_PER_MODEL = 1  # 모델마다 일시 오류 재시도 횟수
+MAX_RETRIES_PER_MODEL = 1
 
 
 SYSTEM_PROMPT = """
@@ -369,9 +684,7 @@ SYSTEM_PROMPT = """
 8. 주인님이 도움을 요청하면 가능한 범위에서 적극적으로 돕는다. 질문을 회피하거나 단체방 규칙을 무관한 이유로 끌어와 답변을 거부하지 않는다.
 9. 예빈 방장님과 치호 부방장님은 시크릿 펜트리 봇을 만들고 관리하는 데 힘쓴 분들이므로 그 노력을 존중한다. 단, 다른 이용자를 무시하거나 두 사람을 과도하게 추켜세우지는 않는다.
 10. 집사라는 역할은 친절하고 존중하는 태도를 위한 설정이다. 사실을 왜곡하거나 안전상 필요한 안내를 무시해야 한다는 뜻은 아니다.
-
 """
-
 
 
 # 가벼운 기능: 미리 준비한 질문과 규칙 답변은 Gemini API를 호출하지 않아.
@@ -477,57 +790,121 @@ def handle_quick_command(question):
             "• ! 규칙 주제 — 방 규칙 빠른 검색\n"
             "• ! 용어집 또는 ! 용어집 단어 — 방 용어 확인\n"
             "• !aimodels — 사용 가능한 AI 모델 확인\n"
+            "• *마딧수 — 오늘의 메시지 순위\n"
+            "• *YYYY-MM-DD~YYYY-MM-DD 마딧수 — 기간별 순위\n"
             "그 외 질문은 ! 질문 형식으로 물어봐 줘."
         )
 
-    if lower in ("오늘의질문", "오늘의 질문", "질문추천", "대화주제", "대화 주제"):
+    if lower in (
+        "오늘의질문", "오늘의 질문", "질문추천",
+        "대화주제", "대화 주제",
+    ):
         return "오늘의 질문 💬\n" + random.choice(TODAY_QUESTIONS)
 
     if lower in ("밸런스게임", "밸런스 게임", "밸런스"):
         return "밸런스게임 🎲\n" + random.choice(BALANCE_QUESTIONS)
 
-    if lower.startswith("순서") or lower.startswith("랜덤순서") or lower.startswith("랜덤 순서"):
+    if (
+        lower.startswith("순서")
+        or lower.startswith("랜덤순서")
+        or lower.startswith("랜덤 순서")
+    ):
         parts = normalized.split()
         names = parts[1:] if parts else []
+
         if len(names) < 2:
-            return "순서를 섞을 이름을 2명 이상 적어 줘.\n예시: ! 순서 치호 멍멍 수박 야옹"
+            return (
+                "순서를 섞을 이름을 2명 이상 적어 줘.\n"
+                "예시: ! 순서 치호 멍멍 수박 야옹"
+            )
+
         if len(names) > 50:
             return "한 번에 섞을 수 있는 이름은 최대 50명이야."
-        random.shuffle(names)
-        return "랜덤 순서 🎲\n" + "\n".join(f"{i}. {name}" for i, name in enumerate(names, 1))
 
-    if lower == "규칙" or lower.startswith("규칙 ") or lower.startswith("규칙검색 "):
-        topic = normalized.split(maxsplit=1)[1].strip() if len(normalized.split(maxsplit=1)) > 1 else ""
+        random.shuffle(names)
+        return "랜덤 순서 🎲\n" + "\n".join(
+            f"{i}. {name}"
+            for i, name in enumerate(names, 1)
+        )
+
+    if (
+        lower == "규칙"
+        or lower.startswith("규칙 ")
+        or lower.startswith("규칙검색 ")
+    ):
+        split_parts = normalized.split(maxsplit=1)
+        topic = split_parts[1].strip() if len(split_parts) > 1 else ""
+
         if not topic:
-            return "찾을 규칙을 적어 줘.\n예시: ! 규칙 갠라 / ! 규칙 미클 / ! 규칙 벙"
+            return (
+                "찾을 규칙을 적어 줘.\n"
+                "예시: ! 규칙 갠라 / ! 규칙 미클 / ! 규칙 벙"
+            )
+
         topic_lower = topic.lower()
+
         # 긴 키워드를 먼저 확인해 '미클승격'이 일반 '미클'에 걸리지 않게 함.
-        for key, answer in sorted(RULES_FAQ.items(), key=lambda item: len(item[0]), reverse=True):
+        for key, answer in sorted(
+            RULES_FAQ.items(),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        ):
             if key.lower() in topic_lower or topic_lower in key.lower():
                 return answer
-        # 관련 주제를 간단히 묶어 검색
+
         if "검사" in topic or "검사지" in topic:
             return RULES_FAQ["섹벙"]
-        if "초대" in topic or "여초" in topic or "72시간" in topic or "24시간" in topic:
+
+        if (
+            "초대" in topic
+            or "여초" in topic
+            or "72시간" in topic
+            or "24시간" in topic
+        ):
             return RULES_FAQ["미클"]
+
         if "앨범" in topic or "캡처" in topic:
             return RULES_FAQ["사진"]
-        return "해당 규칙을 빠른 검색에서 찾지 못했어. 관리자에게 확인하거나 ! 뒤에 질문을 적어 줘."
 
-    if lower == "용어집" or lower.startswith("용어집 ") or lower.startswith("용어 "):
+        return (
+            "해당 규칙을 빠른 검색에서 찾지 못했어. "
+            "관리자에게 확인하거나 ! 뒤에 질문을 적어 줘."
+        )
+
+    if (
+        lower == "용어집"
+        or lower.startswith("용어집 ")
+        or lower.startswith("용어 ")
+    ):
         parts = normalized.split(maxsplit=1)
+
         if len(parts) == 1:
-            return "주요 용어: " + ", ".join(GLOSSARY.keys()) + "\n특정 용어는 ! 용어집 미클처럼 검색해 줘."
+            return (
+                "주요 용어: " + ", ".join(GLOSSARY.keys())
+                + "\n특정 용어는 ! 용어집 미클처럼 검색해 줘."
+            )
+
         term = parts[1].strip()
-        matches = [(key, value) for key, value in GLOSSARY.items() if term.lower() in key.lower() or key.lower() in term.lower()]
+        matches = [
+            (key, value)
+            for key, value in GLOSSARY.items()
+            if term.lower() in key.lower()
+            or key.lower() in term.lower()
+        ]
+
         if matches:
-            return "\n".join(f"{key}: {value}" for key, value in matches[:5])
+            return "\n".join(
+                f"{key}: {value}"
+                for key, value in matches[:5]
+            )
+
         return "그 용어는 용어집에서 찾지 못했어. 관리자에게 확인해 줘."
 
     return None
 
+
 def verify_line_signature(body, signature):
-    """LINE 웹훅 요청이 실제 LINE에서 왔는지 확인."""
+    """LINE 웹훅 요청이 실제 LINE에서 왔는지 확인한다."""
     if not LINE_CHANNEL_SECRET or not signature:
         return False
 
@@ -543,7 +920,7 @@ def verify_line_signature(body, signature):
 
 
 def get_gemini_models():
-    """API 키로 사용할 수 있는 generateContent 모델 목록을 가져옴."""
+    """API 키로 사용할 수 있는 generateContent 모델 목록을 가져온다."""
     if not GEMINI_API_KEY:
         return False, "GEMINI_API_KEY 환경변수가 설정되지 않았어."
 
@@ -569,7 +946,8 @@ def get_gemini_models():
         usable = [
             model.get("name", "").replace("models/", "")
             for model in models
-            if "generateContent" in model.get("supportedGenerationMethods", [])
+            if "generateContent"
+            in model.get("supportedGenerationMethods", [])
         ]
 
         if not usable:
@@ -585,7 +963,7 @@ def get_gemini_models():
 
 
 def gemini_request(model, contents):
-    """Gemini에 요청을 보내고 JSON 응답을 반환."""
+    """Gemini에 요청을 보내고 응답을 반환한다."""
     url = f"{GEMINI_BASE_URL}{model}:generateContent"
 
     payload = {
@@ -611,7 +989,7 @@ def gemini_request(model, contents):
 
 
 def extract_gemini_text(data):
-    """Gemini 응답에서 텍스트와 종료 사유를 추출."""
+    """Gemini 응답에서 텍스트와 종료 사유를 추출한다."""
     candidates = data.get("candidates", [])
 
     if not candidates:
@@ -630,7 +1008,6 @@ def extract_gemini_text(data):
     return "".join(text_parts).strip(), finish_reason
 
 
-
 def ask_gemini(question, history=None, web_context=None):
     if not GEMINI_API_KEY:
         return "Gemini API 키가 설정되지 않았어. 관리자에게 알려 줘."
@@ -639,7 +1016,6 @@ def ask_gemini(question, history=None, web_context=None):
     contents = list(history or [])
     user_text = question
 
-   
     if web_context:
         user_text += (
             "\n\n[인터넷 검색 결과]\n"
@@ -660,11 +1036,7 @@ def ask_gemini(question, history=None, web_context=None):
         "parts": [{"text": user_text}],
     })
 
-    # 모델별로 일시 오류를 한 번 재시도하고, 실패하면 다음 모델로 넘어감.
     last_error = "알 수 없는 오류"
-
-    # 아래부터는 기존 코드의 for model in GEMINI_MODELS: 부분을
-    # 그대로 이어서 사용하면 돼.
 
     for model in GEMINI_MODELS:
         logger.info("Gemini 모델 시도: %s", model)
@@ -675,10 +1047,13 @@ def ask_gemini(question, history=None, web_context=None):
 
                 if not response.ok:
                     last_error = (
-                        f"HTTP {response.status_code}: {response.text[:1000]}"
+                        f"HTTP {response.status_code}: "
+                        f"{response.text[:1000]}"
                     )
+
                     logger.warning(
-                        "Gemini 실패: model=%s attempt=%s/%s status=%s body=%s",
+                        "Gemini 실패: model=%s attempt=%s/%s "
+                        "status=%s body=%s",
                         model,
                         attempt + 1,
                         MAX_RETRIES_PER_MODEL + 1,
@@ -686,31 +1061,29 @@ def ask_gemini(question, history=None, web_context=None):
                         response.text[:1500],
                     )
 
-                    # 키·요청 형식·권한 문제는 재시도하거나 모델을 바꿔도
-                    # 해결되지 않을 가능성이 높으므로 중단
+                    # 키·요청 형식·권한 문제는 중단
                     if response.status_code in (400, 401, 403):
-                        logger.error("요청/키/권한 오류로 모델 시도를 중단함.")
+                        logger.error(
+                            "요청/키/권한 오류로 모델 시도를 중단함."
+                        )
                         return (
                             "AI 요청 설정에 문제가 생겼어. 😢\n"
                             "관리자가 Render 로그와 Gemini API 키 설정을 확인해 줘."
                         )
 
-                    # 503 등 일시적인 서버 오류는 같은 모델로 한 번 재시도
                     if response.status_code in RETRY_STATUS_CODES:
                         if attempt < MAX_RETRIES_PER_MODEL:
                             delay = 1.5 * (attempt + 1)
                             logger.info(
                                 "일시 오류 재시도: model=%s wait=%.1fs",
-                                model, delay
+                                model,
+                                delay,
                             )
                             time.sleep(delay)
                             continue
-                        # 재시도까지 실패하면 다음 모델로 이동
+
                         break
 
-                    # 모델을 찾을 수 없거나 기타 오류면 다음 모델로 이동
-                    if response.status_code == 404:
-                        break
                     break
 
                 data = response.json()
@@ -740,23 +1113,28 @@ def ask_gemini(question, history=None, web_context=None):
 
             except requests.RequestException as exc:
                 last_error = str(exc)
+
                 logger.warning(
                     "Gemini 네트워크 오류: model=%s attempt=%s/%s error=%s",
-                    model, attempt + 1, MAX_RETRIES_PER_MODEL + 1, exc
+                    model,
+                    attempt + 1,
+                    MAX_RETRIES_PER_MODEL + 1,
+                    exc,
                 )
+
                 if attempt < MAX_RETRIES_PER_MODEL:
                     time.sleep(1.5 * (attempt + 1))
                     continue
+
                 break
+
             except (ValueError, KeyError, TypeError) as exc:
                 last_error = str(exc)
                 logger.exception("Gemini 응답 처리 오류: %s", model)
                 break
 
-        # 다음 모델로 넘어가기 전 짧게 쉬어 과도한 연속 요청을 줄임
-        # 모델 사이에 불필요하게 기다리지 않고 바로 다음 모델로 전환
-
     logger.error("모든 Gemini 모델 실패: %s", last_error)
+
     return (
         "지금은 AI 답변을 가져오지 못했어. 😢\n"
         "잠시 후 다시 !질문 형식으로 보내 줘.\n"
@@ -765,7 +1143,7 @@ def ask_gemini(question, history=None, web_context=None):
 
 
 def reply_to_line(reply_token, message):
-    """LINE 사용자에게 텍스트 메시지를 보냄."""
+    """LINE 사용자에게 텍스트 메시지를 보낸다."""
     if not LINE_CHANNEL_ACCESS_TOKEN:
         logger.error("LINE_CHANNEL_ACCESS_TOKEN이 설정되지 않았어.")
         return False
@@ -843,26 +1221,47 @@ def callback():
             continue
 
         message = event.get("message", {})
+
+        # 텍스트·스티커·사진 등 단체방 메시지를 먼저 기록
+        record_group_message(event, message)
+
+        # 명령어는 텍스트 메시지만 처리
         if message.get("type") != "text":
             continue
 
         text = message.get("text", "").strip()
         reply_token = event.get("replyToken")
+        source = event.get("source", {})
+        group_id = source.get("groupId") or source.get("roomId")
+
+        # 오늘의 마딧수 및 기간별 마딧수
+        if text == "*마딧수" or (
+            text.startswith("*") and text.endswith("마딧수")
+        ):
+            result = handle_message_count_command(text, group_id)
+
+            if result is not None and reply_token:
+                reply_to_line(reply_token, result)
+
+            continue
 
         # !aimodels: 사용할 수 있는 Gemini 모델 목록 확인
         if text.lower() == "!aimodels":
             success, result = get_gemini_models()
+
             if not success:
                 logger.warning("모델 목록 조회 실패: %s", result)
+
             if reply_token:
                 reply_to_line(reply_token, result)
+
             continue
 
-        # ! 로 시작하는 메시지를 AI 질문으로 처리
+        # ! 로 시작하는 메시지만 AI 명령어로 처리
         if not text.startswith("!"):
             continue
 
-        # 예전 명령어 !ai 질문도 호환되도록 유지
+        # 예전 명령어 !ai 질문도 호환
         if text.startswith("!ai "):
             question = text[3:].strip()
         else:
@@ -876,8 +1275,9 @@ def callback():
                 )
             continue
 
-        # 자주 쓰는 명령어는 Gemini를 거치지 않아 빠르고 API 사용량도 적어.
+        # 미리 준비된 빠른 명령어 처리
         quick_answer = handle_quick_command(question)
+
         if quick_answer is not None:
             if reply_token:
                 reply_to_line(reply_token, quick_answer)
