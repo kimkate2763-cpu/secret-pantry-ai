@@ -8,6 +8,7 @@ import random
 import psycopg
 from psycopg.rows import dict_row
 import re
+import unicodedata
 
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -596,6 +597,94 @@ def get_item_profile(group_id, user_id):
     return row or {"xp": 0, "last_explore_at": None}
 
 
+def sync_inventory_to_collection(group_id, user_id, conn=None):
+    """현재 인벤토리에 보유 중인 아이템을 도감에도 등록한다.
+
+    기존 도감 기록과 수량은 수정/삭제하지 않고, 빠진 항목만 추가한다.
+    """
+    if conn is not None:
+        conn.execute(
+            """
+            INSERT INTO item_collection (group_id, user_id, item_id, total_found)
+            SELECT group_id, user_id, item_id, 1
+            FROM item_inventory
+            WHERE group_id=%s AND user_id=%s AND quantity > 0
+            ON CONFLICT (group_id, user_id, item_id) DO NOTHING
+            """,
+            (group_id, user_id),
+        )
+        return
+    with get_db() as db:
+        db.execute(
+            """
+            INSERT INTO item_collection (group_id, user_id, item_id, total_found)
+            SELECT group_id, user_id, item_id, 1
+            FROM item_inventory
+            WHERE group_id=%s AND user_id=%s AND quantity > 0
+            ON CONFLICT (group_id, user_id, item_id) DO NOTHING
+            """,
+            (group_id, user_id),
+        )
+
+
+def normalize_member_name(value):
+    """LINE 닉네임 비교용 정규화: 호환문자, 대소문자, 공백 차이를 줄인다."""
+    value = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    # 공백과 제로폭/방향 제어 문자 제거. 장식 기호는 원형을 유지한다.
+    return "".join(ch for ch in value if not ch.isspace() and unicodedata.category(ch) != "Cf")
+
+
+def parse_gift_arguments(args, group_id, sender_user_id):
+    """닉네임에 공백·장식문자가 있어도 아이템 이름/도감 번호를 기준으로 선물을 파싱한다."""
+    with get_db() as conn:
+        members = conn.execute(
+            "SELECT user_id, display_name FROM member_profiles WHERE group_id=%s",
+            (group_id,),
+        ).fetchall()
+
+    # 아이템 이름은 여러 단어일 수 있으므로, 전체 인자 끝에서부터 아이템을 찾는다.
+    item_suffixes = [(item["name"], item) for item in ITEMS]
+    item_suffixes += [(str(index), item) for index, item in enumerate(ITEMS, 1)]
+    item_suffixes.sort(key=lambda pair: len(pair[0]), reverse=True)
+
+    exact_matches = []
+    partial_matches = []
+    args_folded = unicodedata.normalize("NFKC", args).casefold()
+
+    for suffix, item in item_suffixes:
+        suffix_folded = unicodedata.normalize("NFKC", suffix).casefold()
+        if not args_folded.endswith(suffix_folded):
+            continue
+        cut = len(args) - len(suffix)
+        # 아이템 앞에는 닉네임과 아이템을 구분하는 공백이 반드시 있어야 한다.
+        if cut <= 0 or not args[cut - 1].isspace():
+            continue
+        recipient_text = args[:cut].strip()
+        if not recipient_text:
+            continue
+        normalized_input = normalize_member_name(recipient_text)
+        for member in members:
+            if member["user_id"] == sender_user_id:
+                # 본인에게 보내려는 경우도 파싱해, 아래에서 명확한 오류를 안내한다.
+                pass
+            normalized_saved = normalize_member_name(member["display_name"])
+            if normalized_input == normalized_saved:
+                exact_matches.append((member, item))
+            elif normalized_input and normalized_input in normalized_saved:
+                partial_matches.append((member, item))
+
+    # 완전 일치가 있으면 부분 일치보다 우선한다.
+    candidates = exact_matches if exact_matches else partial_matches
+    unique = {}
+    for member, item in candidates:
+        unique[(member["user_id"], item["id"])] = (member, item)
+    if len(unique) == 1:
+        return next(iter(unique.values())), None
+    if len(unique) > 1:
+        return None, "ambiguous"
+    return None, "not_found"
+
+
 def handle_item_game_command(text, group_id, user_id, display_name):
     if not group_id or not user_id:
         return "아이템 게임은 단체방에서만 할 수 있다냥! 🐈"
@@ -657,6 +746,7 @@ def handle_item_game_command(text, group_id, user_id, display_name):
                 f"중복 아이템도 인벤토리에 쌓인다냥! 다음 탐험은 1시간 뒤다.")
 
     if command == "!도감":
+        sync_inventory_to_collection(group_id, user_id)
         with get_db() as conn:
             rows = conn.execute(
                 "SELECT item_id,total_found FROM item_collection WHERE group_id=%s AND user_id=%s",
@@ -676,6 +766,7 @@ def handle_item_game_command(text, group_id, user_id, display_name):
         return "\n".join(lines)
 
     if command == "!인벤토리":
+        sync_inventory_to_collection(group_id, user_id)
         with get_db() as conn:
             rows = conn.execute(
                 "SELECT item_id,quantity FROM item_inventory WHERE group_id=%s AND user_id=%s AND quantity>0 ORDER BY quantity DESC,item_id",
@@ -692,6 +783,7 @@ def handle_item_game_command(text, group_id, user_id, display_name):
         return "\n".join(lines)
 
     if command == "!내정보":
+        sync_inventory_to_collection(group_id, user_id)
         profile = get_item_profile(group_id, user_id)
         with get_db() as conn:
             row = conn.execute(
@@ -711,7 +803,15 @@ def handle_item_game_command(text, group_id, user_id, display_name):
                 f"희귀 아이템을 발견할수록 경험치를 많이 얻는다냥!")
 
     if command == "!아이템순위":
+        # 순위 확인 시에도 기존 인벤토리의 아이템이 도감에 반영되도록 동기화한다.
         with get_db() as conn:
+            conn.execute("""
+                INSERT INTO item_collection (group_id, user_id, item_id, total_found)
+                SELECT i.group_id, i.user_id, i.item_id, 1
+                FROM item_inventory i
+                WHERE i.group_id=%s AND i.quantity > 0
+                ON CONFLICT (group_id, user_id, item_id) DO NOTHING
+            """, (group_id,))
             rows = conn.execute(
                 """SELECT p.user_id, p.xp, COALESCE(m.display_name, p.user_id) AS display_name,
                           (SELECT COUNT(*) FROM item_collection c WHERE c.group_id=p.group_id AND c.user_id=p.user_id) AS kinds,
@@ -728,31 +828,34 @@ def handle_item_game_command(text, group_id, user_id, display_name):
         return "\n".join(lines)
 
     if command == "!선물":
-        parts = args.split(maxsplit=1)
-        if len(parts) != 2:
-            return "사용법: !선물 닉네임 아이템이름\n예시: !선물 치호 반짝 돌멩이\n아이템 이름 대신 도감 번호를 써도 된다냥."
-        recipient_name, item_name = parts
-        item = get_item_by_name(item_name)
-        if not item:
-            return "그런 아이템은 도감에 없다냥! 정확한 아이템 이름이나 도감 번호를 확인해 봐."
-        if recipient_name.casefold() == display_name.casefold():
+        if not args:
+            return ("사용법: !선물 닉네임 아이템이름\n"
+                    "예시: !선물 치호 반짝 돌멩이\n"
+                    "닉네임에 공백이나 장식문자가 있어도 전체 닉네임을 붙여 쓰면 된다냥. "
+                    "아이템 이름 대신 도감 번호를 써도 된다냥.")
+
+        parsed, error = parse_gift_arguments(args, group_id, user_id)
+        if error == "not_found":
+            return ("선물할 상대나 아이템을 찾지 못했다냥!\n"
+                    "사용법: !선물 닉네임 아이템이름\n"
+                    "닉네임은 상대의 LINE 표시 이름과 비슷하게 입력하고, 아이템 이름은 정확히 입력해 봐.")
+        if error == "ambiguous":
+            return ("같은 이름과 비슷한 이름을 가진 방원이 여럿이라 구분할 수 없다냥! "
+                    "상대의 LINE 닉네임 전체를 복사해서 입력해 봐.")
+
+        recipient, item = parsed
+        if recipient["user_id"] == user_id:
             return "자기 자신에게 선물할 수는 없다냥! 다른 방원을 찾아라."
+
         with get_db() as conn:
-            recipients = conn.execute(
-                "SELECT user_id,display_name FROM member_profiles WHERE group_id=%s AND LOWER(display_name)=LOWER(%s) AND user_id<>%s",
-                (group_id, recipient_name, user_id),
-            ).fetchall()
-            if len(recipients) != 1:
-                if not recipients:
-                    return f"'{recipient_name}'이라는 방원을 찾지 못했다냥. 그 사람이 먼저 메시지를 보내 봇에 닉네임이 기록되어 있어야 해."
-                return "같은 닉네임을 쓰는 방원이 여럿이라 선물할 상대를 구분할 수 없다냥! 관리자에게 닉네임 구분 방법을 문의해 줘."
-            recipient = recipients[0]
             sender_row = conn.execute(
                 "SELECT quantity FROM item_inventory WHERE group_id=%s AND user_id=%s AND item_id=%s FOR UPDATE",
                 (group_id, user_id, item["id"]),
             ).fetchone()
             if not sender_row or int(sender_row["quantity"]) < 1:
                 return f"🎒 {display_name}, {item['name']}을(를) 가지고 있지 않다냥! !인벤토리부터 확인해 봐."
+
+            # 한 트랜잭션에서 양도·수령·도감 등록을 처리한다. 기존 기록은 삭제하지 않는다.
             conn.execute(
                 "UPDATE item_inventory SET quantity=quantity-1 WHERE group_id=%s AND user_id=%s AND item_id=%s",
                 (group_id, user_id, item["id"]),
@@ -761,8 +864,13 @@ def handle_item_game_command(text, group_id, user_id, display_name):
                 "INSERT INTO item_inventory (group_id,user_id,item_id,quantity) VALUES (%s,%s,%s,1) ON CONFLICT (group_id,user_id,item_id) DO UPDATE SET quantity=item_inventory.quantity+1",
                 (group_id, recipient["user_id"], item["id"]),
             )
-        return f"🎁 {display_name}이(가) {recipient['display_name']}에게 {item['emoji']} {item['name']}을(를) 선물했다냥! 우정이 깊어졌구나!"
+            conn.execute(
+                "INSERT INTO item_collection (group_id,user_id,item_id,total_found) VALUES (%s,%s,%s,1) ON CONFLICT (group_id,user_id,item_id) DO NOTHING",
+                (group_id, recipient["user_id"], item["id"]),
+            )
 
+        item_label = f"{item['emoji']} {item['name']}" if item["emoji"] else f"🏆 {item['name']}"
+        return f"🎁 {display_name}이(가) {recipient['display_name']}에게 {item_label}을(를) 선물했다냥! 우정이 깊어졌구나!"
     return None
 
 
