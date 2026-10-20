@@ -38,6 +38,9 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 KST = ZoneInfo("Asia/Seoul")
 
+# 현재 시크릿 펜트리 관리자. 닉네임 장식문자가 있어도 이름으로 판별한다.
+ITEM_GAME_ADMIN_NAMES = ("예빈", "치호", "멍멍", "개굴")
+
 
 @contextmanager
 def get_db():
@@ -123,8 +126,14 @@ def init_message_database():
                 user_id TEXT NOT NULL,
                 xp INTEGER NOT NULL DEFAULT 0,
                 last_explore_at TIMESTAMPTZ,
+                explore_bonus BIGINT NOT NULL DEFAULT 0,
                 PRIMARY KEY (group_id, user_id)
             )
+        """)
+        # 기존 데이터베이스에도 안전하게 컬럼만 추가한다. 기존 기록은 삭제하지 않는다.
+        conn.execute("""
+            ALTER TABLE item_game_profiles
+            ADD COLUMN IF NOT EXISTS explore_bonus BIGINT NOT NULL DEFAULT 0
         """)
 
     logger.info("마딧수 및 업적·칭호 데이터베이스 초기화 완료")
@@ -591,10 +600,10 @@ def choose_random_item():
 def get_item_profile(group_id, user_id):
     with get_db() as conn:
         row = conn.execute(
-            "SELECT xp, last_explore_at FROM item_game_profiles WHERE group_id=%s AND user_id=%s",
+            "SELECT xp, last_explore_at, explore_bonus FROM item_game_profiles WHERE group_id=%s AND user_id=%s",
             (group_id, user_id),
         ).fetchone()
-    return row or {"xp": 0, "last_explore_at": None}
+    return row or {"xp": 0, "last_explore_at": None, "explore_bonus": 0}
 
 
 def sync_inventory_to_collection(group_id, user_id, conn=None):
@@ -685,6 +694,69 @@ def parse_gift_arguments(args, group_id, sender_user_id):
     return None, "not_found"
 
 
+def is_item_game_admin(display_name):
+    """관리자 닉네임에 장식문자가 있어도 등록된 관리자 이름을 확인한다."""
+    normalized = normalize_member_name(display_name)
+    return any(normalize_member_name(name) in normalized for name in ITEM_GAME_ADMIN_NAMES)
+
+
+def handle_explore_admin_command(text, group_id, user_id, display_name):
+    """관리자 전용: ! 방원이름 탐험 +N 으로 추가 탐험 횟수를 지급한다."""
+    match = re.match(r"^!\s*(.+?)\s+탐험\s*\+(\d+)\s*$", (text or "").strip())
+    if not match:
+        return None
+
+    if not group_id or not user_id:
+        return "이 명령어는 단체방에서만 사용할 수 있다냥."
+
+    if not is_item_game_admin(display_name):
+        return "⛔ 이 명령어는 관리자만 사용할 수 있다냥!"
+
+    target_text = match.group(1).strip()
+    amount = int(match.group(2))
+    if amount <= 0:
+        return "추가 탐험 횟수는 1 이상으로 입력해라냥. 예: ! 치호 탐험 +3"
+
+    with get_db() as conn:
+        members = conn.execute(
+            "SELECT user_id, display_name FROM member_profiles WHERE group_id=%s",
+            (group_id,),
+        ).fetchall()
+
+        normalized_target = normalize_member_name(target_text)
+        exact = [m for m in members if normalize_member_name(m["display_name"]) == normalized_target]
+        candidates = exact or [
+            m for m in members
+            if normalized_target and normalized_target in normalize_member_name(m["display_name"])
+        ]
+        # 동일 user_id 중복 제거
+        unique = {m["user_id"]: m for m in candidates}
+
+        if not unique:
+            return f"'{target_text}' 방원을 찾지 못했다냥. LINE 닉네임 일부를 입력해 봐."
+        if len(unique) > 1:
+            names = ", ".join(m["display_name"] for m in unique.values())
+            return f"비슷한 닉네임이 여러 명이다냥. 더 정확하게 입력해 줘: {names}"
+
+        target = next(iter(unique.values()))
+        conn.execute(
+            """INSERT INTO item_game_profiles (group_id, user_id, xp, explore_bonus)
+               VALUES (%s, %s, 0, 0)
+               ON CONFLICT (group_id, user_id) DO NOTHING""",
+            (group_id, target["user_id"]),
+        )
+        updated = conn.execute(
+            """UPDATE item_game_profiles
+               SET explore_bonus = explore_bonus + %s
+               WHERE group_id=%s AND user_id=%s
+               RETURNING explore_bonus""",
+            (amount, group_id, target["user_id"]),
+        ).fetchone()
+
+    return (f"🎟️ {target['display_name']}에게 추가 탐험 {amount}회를 지급했다냥!\n"
+            f"현재 사용 가능한 추가 탐험: {int(updated['explore_bonus'])}회")
+
+
 def handle_item_game_command(text, group_id, user_id, display_name):
     if not group_id or not user_id:
         return "아이템 게임은 단체방에서만 할 수 있다냥! 🐈"
@@ -700,22 +772,26 @@ def handle_item_game_command(text, group_id, user_id, display_name):
                 (group_id, user_id),
             )
             row = conn.execute(
-                "SELECT xp,last_explore_at FROM item_game_profiles WHERE group_id=%s AND user_id=%s FOR UPDATE",
+                "SELECT xp,last_explore_at,explore_bonus FROM item_game_profiles WHERE group_id=%s AND user_id=%s FOR UPDATE",
                 (group_id, user_id),
             ).fetchone()
             last = row["last_explore_at"]
+            uses_bonus = False
             if last is not None:
                 if last.tzinfo is None:
                     from datetime import timezone
                     last = last.replace(tzinfo=timezone.utc)
                 remaining = EXPLORE_COOLDOWN_SECONDS - int((now - last.astimezone(KST)).total_seconds())
                 if remaining > 0:
-                    minutes, seconds = divmod(remaining, 60)
-                    return f"🐾 {display_name}, 아직 탐험 기운이 회복되지 않았다냥!\n다음 탐험까지 약 {minutes}분 {seconds}초 남았어."
+                    if int(row.get("explore_bonus", 0) or 0) > 0:
+                        uses_bonus = True
+                    else:
+                        minutes, seconds = divmod(remaining, 60)
+                        return f"🐾 {display_name}, 아직 탐험 기운이 회복되지 않았다냥!\n다음 탐험까지 약 {minutes}분 {seconds}초 남았어."
             item = choose_random_item()
             conn.execute(
-                "UPDATE item_game_profiles SET last_explore_at=%s, xp=xp+%s WHERE group_id=%s AND user_id=%s",
-                (now, item["xp"], group_id, user_id),
+                "UPDATE item_game_profiles SET last_explore_at=%s, xp=xp+%s, explore_bonus=explore_bonus-%s WHERE group_id=%s AND user_id=%s",
+                (now, item["xp"], int(uses_bonus), group_id, user_id),
             )
             conn.execute(
                 "INSERT INTO item_inventory (group_id,user_id,item_id,quantity) VALUES (%s,%s,%s,1) ON CONFLICT (group_id,user_id,item_id) DO UPDATE SET quantity=item_inventory.quantity+1",
@@ -730,6 +806,7 @@ def handle_item_game_command(text, group_id, user_id, display_name):
                 (group_id, user_id),
             ).fetchone()["n"]
             xp = int(row["xp"] or 0) + item["xp"]
+            remaining_bonus = max(0, int(row.get("explore_bonus", 0) or 0) - int(uses_bonus))
         rarity_reaction = {
             "일반": "흠, 쓸모가 있을지는 두고 보자냥.",
             "고급": "오호! 제법 괜찮은 걸 주웠다냥!",
@@ -738,12 +815,17 @@ def handle_item_game_command(text, group_id, user_id, display_name):
             "전설": "뭐, 뭐라고?! 봉인이 풀렸다고?! 네놈이 해냈구나… 이건 시크릿 펜트리의 전설이다냥!",
         }
         found_label = f"{item['emoji']} 발견 아이템: {item['name']}" if item['emoji'] else f"🏆 획득: {item['name']}"
+        cooldown_note = (
+            f"🎟️ 추가 탐험권 1회를 사용했다냥! 남은 추가 탐험권: {remaining_bonus}회."
+            if uses_bonus else
+            "중복 아이템도 인벤토리에 쌓인다냥! 다음 탐험은 1시간 뒤다."
+        )
         return (f"🎒 {display_name}의 탐험 결과\n"
                 f"{found_label}\n"
                 f"💎 등급: {item['rarity']} | ✨ 경험치 +{item['xp']}\n"
                 f"📚 도감 등록: {collection_count}/{len(ITEMS)}종\n"
                 f"{rarity_reaction[item['rarity']]}\n"
-                f"중복 아이템도 인벤토리에 쌓인다냥! 다음 탐험은 1시간 뒤다.")
+                f"{cooldown_note}")
 
     if command == "!도감":
         sync_inventory_to_collection(group_id, user_id)
@@ -800,6 +882,7 @@ def handle_item_game_command(text, group_id, user_id, display_name):
                 f"⭐ 레벨: {level} (경험치 {xp} / 다음 레벨까지 {100 - xp % 100})\n"
                 f"📚 도감: {found}/{len(ITEMS)}종\n"
                 f"🎒 보유 아이템: {int(row['copies'])}개 / {int(row['kinds'])}종\n"
+                f"🎟️ 추가 탐험 가능 횟수: {int(profile.get('explore_bonus', 0) or 0)}회\n"
                 f"희귀 아이템을 발견할수록 경험치를 많이 얻는다냥!")
 
     if command == "!아이템순위":
@@ -1093,7 +1176,7 @@ SYSTEM_PROMPT = """
   강퇴 대상이야. 남성에게 먼저 연락을 받은 여성이 불편함을 느끼면
   관리자에게 신고할 수 있어.
 - 여초는 여성 초대, 남초는 남성 초대를 뜻해.
-- 여초·남초 요청은 관리자 예빈, 치호, 수박, 멍멍을 태그한 뒤
+- 여초·남초 요청은 관리자 예빈, 치호, 멍멍, 개굴을 태그한 뒤
   '여초 1' 또는 '남초 1'이라고 작성해.
 - 관리자가 인증방으로 초대해 주는 방식이야.
 - 여성 초대 기준은 여성 2명 24시간 또는 여성 1명 72시간이야.
@@ -1772,6 +1855,15 @@ def callback():
         reply_token = event.get("replyToken")
         source = event.get("source", {})
         group_id = source.get("groupId") or source.get("roomId")
+
+        # 관리자 전용 추가 탐험 지급 명령어: ! 방원이름 탐험 +3
+        if re.match(r"^!\s*.+?\s+탐험\s*\+\d+\s*$", text):
+            user_id = source.get("userId")
+            display_name = get_member_display_name(group_id, user_id) if group_id and user_id else "회원"
+            result = handle_explore_admin_command(text, group_id, user_id, display_name)
+            if result and reply_token:
+                reply_to_line(reply_token, result)
+            continue
 
         # 랜덤 아이템 수집 게임 명령어 (AI 호출보다 먼저 처리)
         normalized_item_command = re.sub(r"^!\s*", "!", text)
